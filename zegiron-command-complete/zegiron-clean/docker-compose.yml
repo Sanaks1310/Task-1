@@ -1,0 +1,164 @@
+##############################################################################
+#  ZEGIRON Command — Docker Compose
+#  docker-compose.yml
+#
+#  Services:
+#    nginx      — reverse proxy + TLS termination (ports 80/443/8443)
+#    gateway    — WebSocket server (scale: docker compose up --scale gateway=4)
+#    frontend   — Static React build served by nginx
+#    redis      — JWT revocation + session store
+#    msdf-stub  — MSDF engine stub for local dev (profile: dev)
+#
+#  Usage:
+#    Development:  docker compose --profile dev up --build
+#    Production:   docker compose up --build -d
+#    Scale:        docker compose up --scale gateway=4 -d
+##############################################################################
+
+version: "3.9"
+
+# ─── Reusable gateway config ──────────────────────────────────────────────────
+x-gateway: &gateway-base
+  build:
+    context:    ./gateway
+    dockerfile: Dockerfile
+  image: zegiron/gateway:${VERSION:-latest}
+  environment: &gateway-env
+    NODE_ENV:        production
+    SINGLE_WORKER:   "true"
+    PORT:            "4000"
+    JWT_SECRET:      "${JWT_SECRET:?JWT_SECRET must be set}"
+    REDIS_URL:       "redis://redis:6379"
+    MSDF_HOST:       "${MSDF_HOST:-msdf-stub}"
+    MSDF_PORT:       "${MSDF_PORT:-9090}"
+    LOG_LEVEL:       "${LOG_LEVEL:-info}"
+    MAX_CLIENTS:     "2000"
+  networks:   [zegiron]
+  depends_on:
+    redis:      { condition: service_healthy }
+  restart:    unless-stopped
+  deploy:
+    resources:
+      limits:   { cpus: "2.0", memory: 2G }
+      reservations: { cpus: "0.25", memory: 256M }
+  logging:
+    driver: json-file
+    options: { max-size: "50m", max-file: "3" }
+  healthcheck:
+    test:         ["CMD", "wget", "-qO-", "http://localhost:4000/health"]
+    interval:     10s
+    timeout:      5s
+    retries:      3
+    start_period: 20s
+
+# ─── Networks ─────────────────────────────────────────────────────────────────
+networks:
+  zegiron:
+    name: zegiron_custom_net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.250.0.0/24
+
+# ─── Volumes ─────────────────────────────────────────────────────────────────
+volumes:
+  redis-data:
+
+# ─── Services ─────────────────────────────────────────────────────────────────
+services:
+
+  # ── NGINX ─────────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: zegiron-nginx
+    ports:
+      - "8888:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    networks:   [zegiron]
+    depends_on:
+      gateway:
+        condition: service_started
+      frontend:
+        condition: service_started
+    restart:    unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 256M }
+    healthcheck:
+      test:     ["CMD", "wget", "-qO-", "http://localhost/health"]
+      interval: 10s
+      timeout:  3s
+      retries:  3
+
+  # ── Frontend (static build) ───────────────────────────────────────────────
+  frontend:
+    build:
+      context:    ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_WS_URL: "${VITE_WS_URL:-wss://localhost:8443/ws}"
+    image: zegiron/frontend:latest
+    container_name: zegiron-frontend
+    ports:
+      - "8080:80"
+    networks:   [zegiron]
+    restart:    unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+    healthcheck:
+      test:     ["CMD", "wget", "-qO-", "http://localhost/health"]
+      interval: 15s
+      timeout:  3s
+      retries:  3
+
+  # ── Gateway (scale this service for horizontal scaling) ───────────────────
+  gateway:
+    image: zegiron/gateway:latest
+    ports:
+      - "4000:4000"
+    <<: *gateway-base
+    container_name: zegiron-gateway
+
+  # ── Redis ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: zegiron-redis
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --requirepass "${REDIS_PASSWORD:-zegiron_redis_dev}"
+    volumes:
+      - redis-data:/data
+    networks:   [zegiron]
+    restart:    unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 384M }
+    healthcheck:
+      test:     ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-zegiron_redis_dev}", "ping"]
+      interval: 10s
+      timeout:  3s
+      retries:  3
+
+  # ── MSDF Stub (dev/test only) ─────────────────────────────────────────────
+  msdf-stub:
+    build:
+      context:    ./msdf-stub
+      dockerfile: Dockerfile
+    image: zegiron/msdf-stub:dev
+    container_name: zegiron-msdf-stub
+    environment:
+      TRACK_COUNT: "${MOCK_TRACKS:-10000}"
+      UPDATE_HZ:   "${MOCK_HZ:-10}"
+      PORT:        "9090"
+    networks:   [zegiron]
+    restart:    unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+    profiles:   [dev]
